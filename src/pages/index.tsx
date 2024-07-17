@@ -1,118 +1,567 @@
-import Image from "next/image";
-import { Inter } from "next/font/google";
+import { useState } from "react";
+import { SecretNetworkClient } from "secretjs";
+import BigNumber from "bignumber.js";
+import { Window } from "@keplr-wallet/types";
+import fullPoolsData from "@/outputs/fullPoolsData.json";
+import fullTokenDecimals from "@/outputs/fullTokenDecimals.json";
 
-const inter = Inter({ subsets: ["latin"] });
+import { SwapPair } from "@/classes/SwapPair";
+import { Signer } from "secretjs/dist/wallet_amino";
+import {
+  GAS_FOR_BASE_SWAP_ROUTE,
+  GAS_FOR_SWAP_NATIVE_COIN,
+} from "@/constants/gasPrices";
+import { getFeeForExecute } from "@/utils/getFeeForExecute";
+import { AsyncSender } from "@/classes/AsyncSender";
+import { getOfferAndAskPools } from "@/utils/getOfferAndAskPools";
+import { SwapTokenMap } from "@/types/SwapToken";
+import { compute_swap } from "@/utils/computeSwap";
 
-export default function Home() {
+const connectKeplr = async () => {
+  await (window as Window).keplr?.enable("secret-4");
+  const offlineSigner = (window as Window).getOfflineSigner?.("secret-4");
+  const accounts = await offlineSigner?.getAccounts();
+  return {
+    address: accounts?.[0].address,
+    signer: offlineSigner,
+  };
+};
+
+const createClient = async (signer: Signer) => {
+  const accounts = await signer.getAccounts();
+  const client = new SecretNetworkClient({
+    url: "https://scrt.public-rpc.com",
+    wallet: signer,
+    walletAddress: accounts[0].address,
+    chainId: "secret-4",
+  });
+  return client;
+};
+
+const SwapForm = () => {
+  const [fromToken, setFromToken] = useState("");
+  const [toToken, setToToken] = useState("");
+  const [fromAmount, setFromAmount] = useState("");
+  const [expectedReturn, setExpectedReturn] = useState("");
+  const [keplrConnection, setKeplrConnection] = useState<{
+    address: string | undefined;
+    signer: Signer | undefined;
+  } | null>(null);
+  const [client, setClient] = useState<SecretNetworkClient | null>(null);
+  const [error, setError] = useState("");
+
+  const handleConnectKeplr = async () => {
+    try {
+      const keplrConn = await connectKeplr();
+      if (!keplrConn?.signer) throw new Error("Keplr signer not found");
+      const secretjs = await createClient(keplrConn.signer);
+      setKeplrConnection(keplrConn);
+      setClient(secretjs);
+    } catch (err) {
+      setError("Failed to connect to Keplr");
+      console.error(err);
+    }
+  };
+
+  const handleSwap = async () => {
+    if (!keplrConnection || !client || !keplrConnection.address) {
+      setError("Please connect to Keplr first");
+      return;
+    }
+
+    try {
+      const routes = fullPoolsData.reduce((acc, pool) => {
+        const addresses = pool.query_result.assets.map((asset) =>
+          asset.info.token
+            ? asset.info.token.contract_addr
+            : asset.info.native_token.denom
+        );
+        acc.push(addresses);
+        return acc;
+      }, [] as string[][]);
+
+      const tokens = fullPoolsData.reduce((acc, pool) => {
+        pool.query_result.assets.forEach((asset) => {
+          if (asset.info.token) {
+            acc[asset.info.token.contract_addr] = {
+              address: asset.info.token.contract_addr,
+              code_hash: asset.info.token.token_code_hash,
+            };
+          }
+        });
+        return acc;
+      }, {} as { [key: string]: { address: string; code_hash: string } });
+      // const fromTokenMap = new Map(Object.values(tokens).map(token => [token.address, token]));
+      // const toTokenMap = new Map(Object.values(tokens).map(token => [token.address, token]));
+      // output: (property) BestRouteParams.tokens: SwapTokenMap,
+      /*
+      
+      export type SwapTokenMap = Map<string, SwapToken>;
+
+export type SwapToken = {
+  symbol: string;
+  logo?: string;
+  identifier?: string;
+  decimals?: number;
+  address?: string;
+  name?: string;
+  balance?: string;
+  price?: number;
+};
+*/
+      const fromTokenAddr = fromToken;
+      const toTokenAddr = toToken;
+
+      const addSymbolToToken = (token: (typeof tokens)["0"]) => {
+        return {
+          ...token,
+          symbol:
+            fullTokenDecimals.find(
+              (fullToken) => fullToken.contract_addr === token.address
+            )?.token_name ?? "",
+        };
+      };
+
+      // tokens contians all tokens. we need only from and to
+      const tokensPairMap = new Map([
+        [fromTokenAddr, addSymbolToToken(tokens[fromTokenAddr])],
+        [toTokenAddr, addSymbolToToken(tokens[toTokenAddr])],
+      ]);
+
+      const bestRouteData = getBestRoute({
+        fromInput: parseFloat(fromAmount),
+        toInput: parseFloat(expectedReturn),
+        cachedGasFeesUnfilledCoin: [0.12],
+        isToEstimated: true,
+        routes: routes,
+        tokens: tokensPairMap,
+        pairs: new Map([
+          ["a:b", { contract_addr: "secret1...", asset_infos: [] }],
+        ]),
+        balances: { a: "1000000", b: "1000000" },
+      });
+
+      if (bestRouteData.bestRoute) {
+        const hops = await getHops(
+          bestRouteData.bestRoute,
+          bestRouteData.pairs,
+          client
+        );
+
+        await executeRouterSwap(
+          new AsyncSender(client),
+          keplrConnection.address,
+          fromToken,
+          fromAmount,
+          hops,
+          expectedReturn,
+          bestRouteData.bestRoute
+        );
+      } else {
+        setError("No valid route found");
+      }
+    } catch (err) {
+      setError("Swap failed");
+      console.error(err);
+    }
+  };
+
   return (
-    <main
-      className={`flex min-h-screen flex-col items-center justify-between p-24 ${inter.className}`}
-    >
-      <div className="z-10 max-w-5xl w-full items-center justify-between font-mono text-sm lg:flex">
-        <p className="fixed left-0 top-0 flex w-full justify-center border-b border-gray-300 bg-gradient-to-b from-zinc-200 pb-6 pt-8 backdrop-blur-2xl dark:border-neutral-800 dark:bg-zinc-800/30 dark:from-inherit lg:static lg:w-auto  lg:rounded-xl lg:border lg:bg-gray-200 lg:p-4 lg:dark:bg-zinc-800/30">
-          Get started by editing&nbsp;
-          <code className="font-mono font-bold">src/pages/index.tsx</code>
-        </p>
-        <div className="fixed bottom-0 left-0 flex h-48 w-full items-end justify-center bg-gradient-to-t from-white via-white dark:from-black dark:via-black lg:static lg:h-auto lg:w-auto lg:bg-none">
-          <a
-            className="pointer-events-none flex place-items-center gap-2 p-8 lg:pointer-events-auto lg:p-0"
-            href="https://vercel.com?utm_source=create-next-app&utm_medium=default-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            By{" "}
-            <Image
-              src="/vercel.svg"
-              alt="Vercel Logo"
-              className="dark:invert"
-              width={100}
-              height={24}
-              priority
-            />
-          </a>
-        </div>
-      </div>
-
-      <div className="relative flex place-items-center before:absolute before:h-[300px] before:w-full sm:before:w-[480px] before:-translate-x-1/2 before:rounded-full before:bg-gradient-radial before:from-white before:to-transparent before:blur-2xl before:content-[''] after:absolute after:-z-20 after:h-[180px] after:w-full sm:after:w-[240px] after:translate-x-1/3 after:bg-gradient-conic after:from-sky-200 after:via-blue-200 after:blur-2xl after:content-[''] before:dark:bg-gradient-to-br before:dark:from-transparent before:dark:to-blue-700/10 after:dark:from-sky-900 after:dark:via-[#0141ff]/40 before:lg:h-[360px]">
-        <Image
-          className="relative dark:drop-shadow-[0_0_0.3rem_#ffffff70] dark:invert"
-          src="/next.svg"
-          alt="Next.js Logo"
-          width={180}
-          height={37}
-          priority
+    <div className="container mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Token Swap</h1>
+      {error && <div className="text-red-500 mb-4">{error}</div>}
+      <div className="mb-4">
+        <label className="block text-sm font-medium text-gray-700">
+          From Token
+        </label>
+        <input
+          type="text"
+          value={fromToken}
+          onChange={(e) => setFromToken(e.target.value)}
+          className="mt-1 block w-full p-2 border border-gray-300 rounded-md"
         />
       </div>
-
-      <div className="mb-32 grid text-center lg:max-w-5xl lg:w-full lg:mb-0 lg:grid-cols-4 lg:text-left">
-        <a
-          href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=default-template-tw&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Docs{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Find in-depth information about Next.js features and API.
-          </p>
-        </a>
-
-        <a
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=default-template-tw&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Learn{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Learn about Next.js in an interactive course with&nbsp;quizzes!
-          </p>
-        </a>
-
-        <a
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=default-template-tw&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Templates{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Discover and deploy boilerplate example Next.js&nbsp;projects.
-          </p>
-        </a>
-
-        <a
-          href="https://vercel.com/new?utm_source=create-next-app&utm_medium=default-template-tw&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Deploy{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50 text-balance`}>
-            Instantly deploy your Next.js site to a shareable URL with Vercel.
-          </p>
-        </a>
+      <div className="mb-4">
+        <label className="block text-sm font-medium text-gray-700">
+          To Token
+        </label>
+        <input
+          type="text"
+          value={toToken}
+          onChange={(e) => setToToken(e.target.value)}
+          className="mt-1 block w-full p-2 border border-gray-300 rounded-md"
+        />
       </div>
-    </main>
+      <div className="mb-4">
+        <label className="block text-sm font-medium text-gray-700">
+          From Amount
+        </label>
+        <input
+          type="number"
+          value={fromAmount}
+          onChange={(e) => setFromAmount(e.target.value)}
+          className="mt-1 block w-full p-2 border border-gray-300 rounded-md"
+        />
+      </div>
+      <div className="mb-4">
+        <label className="block text-sm font-medium text-gray-700">
+          Expected Return
+        </label>
+        <input
+          type="number"
+          value={expectedReturn}
+          onChange={(e) => setExpectedReturn(e.target.value)}
+          className="mt-1 block w-full p-2 border border-gray-300 rounded-md"
+        />
+      </div>
+      <div className="flex space-x-4">
+        <button
+          onClick={handleConnectKeplr}
+          className="px-4 py-2 bg-blue-600 text-white rounded-md"
+        >
+          Connect Keplr
+        </button>
+        <button
+          onClick={handleSwap}
+          className="px-4 py-2 bg-green-600 text-white rounded-md"
+        >
+          Swap
+        </button>
+      </div>
+    </div>
+  );
+};
+
+export default SwapForm;
+
+const getHops = async (
+  bestRoute: string[],
+  pairs: Map<string, SwapPair>,
+  secretjs: SecretNetworkClient
+) => {
+  // Placeholder function to get hops
+  // Replace with your actual implementation
+  return bestRoute.map((token) => ({
+    from_token: { address: token, code_hash: "..." },
+    pair_address: pairs.get(token)?.contract_addr || "",
+    pair_code_hash: "...",
+  }));
+};
+
+export function getBestRoute({
+  fromInput,
+  toInput,
+  cachedGasFeesUnfilledCoin,
+  isToEstimated,
+  routes,
+  tokens,
+  pairs,
+  balances,
+}: BestRouteParams): {
+  bestRoute: string[] | null;
+  allRoutesOutputs: RouteOutput[];
+  bestRouteToInput: BigNumber;
+  bestRouteFromInput: BigNumber;
+} {
+  const allRoutesOutputs: RouteOutput[] = [];
+  let bestRoute: string[] | null = null;
+
+  let bestRouteToInput = new BigNumber(-Infinity);
+  let bestRouteToInputWithGas = new BigNumber(-Infinity);
+  let bestRouteFromInput = new BigNumber(Infinity);
+  let bestRouteFromInputWithGas = new BigNumber(Infinity);
+
+  for (const route of routes) {
+    if (isToEstimated || toInput === null) {
+      let from = new BigNumber(fromInput);
+      let to = new BigNumber(0);
+      for (let i = 0; i < route.length - 1; i++) {
+        const fromToken = route[i];
+        const toToken = route[i + 1];
+        const pair = pairs.get(
+          `${fromToken}${SwapPair.id_delimiter}${toToken}`
+        );
+        if (!pair) break;
+
+        const { offer_pool, ask_pool } = getOfferAndAskPools(
+          fromToken,
+          toToken,
+          pair,
+          tokens,
+          balances
+        );
+
+        const offer_amount = from;
+        if (
+          offer_pool.isEqualTo(0) ||
+          ask_pool.isEqualTo(0) ||
+          offer_amount.isNaN() ||
+          offer_amount.isLessThanOrEqualTo(0)
+        ) {
+          to = new BigNumber(0);
+          break;
+        }
+
+        const { return_amount } = compute_swap(
+          offer_pool,
+          ask_pool,
+          offer_amount
+        );
+
+        if (return_amount.isNaN() || return_amount.isLessThanOrEqualTo(0)) {
+          to = new BigNumber(0);
+          break;
+        }
+
+        to = return_amount;
+
+        if (i < route.length - 2) {
+          from = return_amount;
+        }
+      }
+
+      const toWithGas = to.minus(cachedGasFeesUnfilledCoin[route.length - 1]);
+      allRoutesOutputs.push({ route, toOutput: to, toWithGas });
+
+      if (toWithGas.isGreaterThan(bestRouteToInputWithGas)) {
+        bestRouteFromInput = new BigNumber(fromInput);
+        bestRouteToInput = to;
+        bestRouteToInputWithGas = toWithGas;
+        bestRoute = route;
+      }
+    } else {
+      let from = new BigNumber(0);
+      let to = new BigNumber(toInput);
+      for (let i = route.length - 1; i > 0; i--) {
+        const fromToken = route[i - 1];
+        const toToken = route[i];
+        const pair = pairs.get(
+          `${fromToken}${SwapPair.id_delimiter}${toToken}`
+        );
+        if (!pair) break;
+
+        const { offer_pool, ask_pool } = getOfferAndAskPools(
+          fromToken,
+          toToken,
+          pair,
+          tokens,
+          balances
+        );
+
+        const ask_amount = to;
+        if (
+          offer_pool.isEqualTo(0) ||
+          ask_pool.isEqualTo(0) ||
+          ask_amount.gt(ask_pool) ||
+          ask_amount.isNaN() ||
+          ask_amount.isZero()
+        ) {
+          from = new BigNumber(Infinity);
+          break;
+        }
+
+        const { offer_amount } = compute_offer_amount(
+          offer_pool,
+          ask_pool,
+          ask_amount
+        );
+
+        if (offer_amount.isNaN() || offer_amount.isLessThanOrEqualTo(0)) {
+          from = new BigNumber(Infinity);
+          break;
+        }
+
+        from = offer_amount;
+
+        if (i > 1) {
+          to = offer_amount;
+        }
+      }
+
+      const fromWithGas = from.plus(
+        cachedGasFeesUnfilledCoin[route.length - 1]
+      );
+
+      allRoutesOutputs.push({ route, fromOutput: from, fromWithGas });
+
+      if (fromWithGas.isLessThan(bestRouteFromInputWithGas)) {
+        bestRouteFromInput = from;
+        bestRouteFromInputWithGas = fromWithGas;
+        bestRouteToInput = new BigNumber(toInput);
+        bestRoute = route;
+      }
+    }
+  }
+
+  return { bestRoute, allRoutesOutputs, bestRouteToInput, bestRouteFromInput };
+}
+
+export async function executeRouterSwap(
+  secretjsSender: AsyncSender,
+  secretAddress: string,
+  fromToken: string,
+  fromAmount: string,
+  hops: (null | {
+    from_token: { address: string; code_hash: string } | "scrt";
+    pair_address: string;
+    pair_code_hash: string;
+  })[],
+  expected_return: string,
+  bestRoute: string[]
+) {
+  const AMM_ROUTER_CONTRACT = "secret1..."; // Your AMM router contract address
+
+  const msg = {
+    receive: {
+      from: secretAddress,
+      amount: fromAmount,
+      msg: btoa(
+        JSON.stringify({
+          to: secretAddress,
+          hops,
+          expected_return,
+        })
+      ),
+    },
+  };
+
+  if (fromToken === "uscrt") {
+    return secretjsSender.asyncExecute(
+      AMM_ROUTER_CONTRACT,
+      secretAddress,
+      msg,
+      "",
+      [
+        {
+          amount: fromAmount,
+          denom: "uscrt",
+        },
+      ],
+      getFeeForExecute((bestRoute.length - 1) * GAS_FOR_BASE_SWAP_ROUTE)
+    );
+  } else {
+    return secretjsSender.asyncExecute(
+      fromToken,
+      secretAddress,
+      {
+        send: {
+          recipient: AMM_ROUTER_CONTRACT,
+          amount: fromAmount,
+          msg: btoa(
+            JSON.stringify({
+              to: secretAddress,
+              hops,
+              expected_return,
+            })
+          ),
+        },
+      },
+      "",
+      [],
+      getFeeForExecute((bestRoute.length - 1) * GAS_FOR_BASE_SWAP_ROUTE)
+    );
+  }
+}
+
+export async function executeSwapUscrt(
+  secretjsSender: AsyncSender,
+  secretAddress: string,
+  pair: SwapPair,
+  fromAmount: string,
+  expected_return: string
+) {
+  return secretjsSender.asyncExecute(
+    pair.contract_addr,
+    secretAddress,
+    {
+      swap: {
+        offer_asset: {
+          info: { native_token: { denom: "uscrt" } },
+          amount: fromAmount,
+        },
+        expected_return,
+      },
+    },
+    "",
+    [
+      {
+        amount: fromAmount,
+        denom: "uscrt",
+      },
+    ],
+    getFeeForExecute(GAS_FOR_SWAP_NATIVE_COIN)
   );
 }
+
+interface SwapToken {
+  address: string;
+  code_hash: string;
+}
+
+interface RouteOutput {
+  route: string[];
+  toOutput?: BigNumber;
+  toWithGas?: BigNumber;
+  fromOutput?: BigNumber;
+  fromWithGas?: BigNumber;
+}
+
+interface BestRouteParams {
+  fromInput: number;
+  toInput: number;
+  cachedGasFeesUnfilledCoin: number[];
+  isToEstimated: boolean;
+  routes: string[][];
+  tokens: SwapTokenMap;
+  pairs: Map<string, SwapPair>;
+  balances: Record<string, string>;
+}
+export const compute_offer_amount = (
+  offer_pool: BigNumber,
+  ask_pool: BigNumber,
+  ask_amount: BigNumber
+): {
+  offer_amount: BigNumber;
+  spread_amount: BigNumber;
+  commission_amount: BigNumber;
+} => {
+  // ask => offer
+  // offer_amount = cp / (ask_pool - ask_amount / (1 - commission_rate)) - offer_pool
+  const cp = offer_pool.multipliedBy(ask_pool);
+  const one_minus_commission = new BigNumber(1).minus(COMMISSION_RATE);
+
+  const offer_amount = cp
+    .multipliedBy(
+      new BigNumber(1).dividedBy(
+        ask_pool.minus(
+          ask_amount.multipliedBy(reverse_decimal(one_minus_commission))
+        )
+      )
+    )
+    .minus(offer_pool);
+
+  const before_commission_deduction = ask_amount.multipliedBy(
+    reverse_decimal(one_minus_commission)
+  );
+
+  let spread_amount = new BigNumber(0);
+  try {
+    spread_amount = offer_amount
+      .multipliedBy(ask_pool.dividedBy(offer_pool))
+      .minus(before_commission_deduction);
+  } catch (e) {}
+
+  const commission_amount =
+    before_commission_deduction.multipliedBy(COMMISSION_RATE);
+  return { offer_amount, spread_amount, commission_amount };
+};
+
+export const reverse_decimal = (decimal: BigNumber): BigNumber => {
+  if (decimal.isEqualTo(0)) {
+    return new BigNumber(0);
+  }
+
+  return DECIMAL_FRACTIONAL.dividedBy(decimal.multipliedBy(DECIMAL_FRACTIONAL));
+};
+const DECIMAL_FRACTIONAL = new BigNumber(1_000_000_000);
+const COMMISSION_RATE = new BigNumber(0.3 / 100);
