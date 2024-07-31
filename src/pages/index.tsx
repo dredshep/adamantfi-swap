@@ -16,6 +16,7 @@ import { AsyncSender } from "@/classes/AsyncSender";
 import { getOfferAndAskPools } from "@/utils/getOfferAndAskPools";
 import { SwapTokenMap } from "@/types/SwapToken";
 import { compute_swap } from "@/utils/computeSwap";
+import { Token } from "@/types/Token";
 
 const connectKeplr = async () => {
   await (window as Window).keplr?.enable("secret-4");
@@ -127,6 +128,28 @@ export type SwapToken = {
         [fromTokenAddr, addSymbolToToken(tokens[fromTokenAddr])],
         [toTokenAddr, addSymbolToToken(tokens[toTokenAddr])],
       ]);
+      const sampleSwapPair = new SwapPair(
+        "symbol0",
+        {
+          token: {
+            contract_addr: "a",
+            token_code_hash: "b",
+            viewing_key: "c",
+          },
+        } as Token,
+        "symbol1",
+        {
+          token: {
+            contract_addr: "d",
+            token_code_hash: "e",
+            viewing_key: "f",
+          },
+        } as Token,
+        "contract_addr",
+        "liquidity_token",
+        "pair_identifier"
+      ).pair_identifier,
+    ]]);
 
       const bestRouteData = getBestRoute({
         fromInput: parseFloat(fromAmount),
@@ -135,9 +158,30 @@ export type SwapToken = {
         isToEstimated: true,
         routes: routes,
         tokens: tokensPairMap,
-        pairs: new Map([
-          ["a:b", { contract_addr: "secret1...", asset_infos: [] }],
-        ]),
+        pairs: new Map([[ "symbol0",
+          // (alias) new SwapPair(symbol0: string, asset0: NativeToken | Token, symbol1: string, asset1: NativeToken | Token, contract_addr: string, liquidity_token: string, pair_identifier: string): SwapPair
+          new SwapPair(
+            "symbol0",
+            {
+              token: {
+                contract_addr: "a",
+                token_code_hash: "b",
+                viewing_key: "c",
+              },
+            } as Token,
+            "symbol1",
+            {
+              token: {
+                contract_addr: "d",
+                token_code_hash: "e",
+                viewing_key: "f",
+              },
+            } as Token,
+            "contract_addr",
+            "liquidity_token",
+            "pair_identifier"
+          ).pair_identifier,
+        ]]),
         balances: { a: "1000000", b: "1000000" },
       });
 
